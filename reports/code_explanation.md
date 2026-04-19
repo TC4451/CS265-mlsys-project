@@ -604,7 +604,190 @@ Phase 2's `mu_two_algorithm()` produces an `ACDecision` containing:
 2. `projected_peak` / `memory_saved` — for reporting
 3. `iteration_log` — for the convergence plot
 
-Phase 3 (not yet implemented) will use `ACDecision.recompute` to:
-1. For each recomputed activation, use `_extract_graph_with_inputs_outputs()` to get the forward subgraph
-2. Insert that subgraph into the backward pass just before `first_bwd_use`
-3. Replace backward uses of the original activation with the recomputed version
+Phase 3's `apply_ac_to_graph()` uses `ACDecision.recompute` to:
+1. For each recomputed activation, call `find_recomp_inputs()` to walk backward to available nodes
+2. Call `_extract_graph_with_inputs_outputs()` to get the minimal recomputation subgraph
+3. Insert that subgraph into the backward pass just before `first_bwd_use`
+4. Call `replace_subsequent_uses_of()` to redirect backward uses to the recomputed node
+
+---
+
+## 6. graph_rewriter.py — Phase 3 Graph Rewriter
+
+### 6.1 `replace_subsequent_uses_of()` (lines 29–44)
+
+```python
+def replace_subsequent_uses_of(graph, old_node, new_node):
+    old_node_users = dict(old_node.users)  # snapshot
+    for node in reversed(list(graph.nodes)):
+        if node == new_node:
+            break
+        if node in old_node_users:
+            node.replace_input_with(old_node, new_node)
+```
+
+This replaces uses of `old_node` with `new_node`, but ONLY for nodes that appear after `new_node` in the graph. This is critical for correctness:
+
+- **Forward uses must stay on `old_node`**: The forward pass executes first and needs the original activation. The recomputed node doesn't exist yet during forward.
+- **Backward uses switch to `new_node`**: By the time backward reaches the insertion point, the original activation has been freed (Phase 2's decision). The recomputed version is now available.
+
+**Why `dict(old_node.users)` snapshot?** `node.users` is a live view that changes when `replace_input_with` is called. Iterating over a mutating dict raises `RuntimeError`. The snapshot freezes the user set.
+
+**Why reversed iteration?** We walk backwards from the graph end. When we hit `new_node`, we stop — everything before it is "forward" and stays untouched.
+
+### 6.2 `find_recomp_inputs()` (lines 51–100)
+
+```python
+def find_recomp_inputs(act_node, retained_names, act_names):
+    inputs = []
+    seen = set()
+    stack = list(act_node.all_input_nodes)
+    while stack:
+        node = stack.pop()
+        if node.name in seen:
+            continue
+        seen.add(node.name)
+        is_recomputed_act = (node.name in act_names) and (node.name not in retained_names)
+        if is_recomputed_act:
+            stack.extend(node.all_input_nodes)
+        else:
+            inputs.append(node)
+    return deduplicated(inputs)
+```
+
+This is a backward BFS/DFS through the FX graph. Starting from the activation's direct inputs, it walks backwards:
+
+- **If a node is a recomputed activation**: It won't be in memory during backward. We trace through it by pushing its inputs onto the stack. The subgraph extractor will automatically include the ops needed to recompute it.
+- **If a node is anything else** (placeholder, param, retained activation, non-activation op): It will be in memory. We stop here and add it to the inputs list.
+
+**Example**: Forward graph: `param → conv → relu → pool`. If `relu` is recomputed and `conv` is retained:
+- `find_recomp_inputs(relu, retained={conv}, acts={conv, relu, pool})` starts with `relu`'s input = `[conv]`
+- `conv` is in `retained_names` → it's available → add to inputs
+- Result: `[conv]`
+- The subgraph from `conv` to `relu` is just the `relu` op itself.
+
+If both `relu` AND `conv` are recomputed:
+- Start with `relu`'s input = `[conv]`
+- `conv` is in `act_names` but NOT in `retained_names` → recomputed → trace through it
+- Push `conv`'s input = `[param]`
+- `param` is not in `act_names` → available → add to inputs
+- Result: `[param]`
+- The subgraph from `param` to `relu` includes both the `conv` and `relu` ops.
+
+**Why `seen` set for deduplication?** In graphs with skip connections (like ResNet), multiple paths can lead to the same input node. Without deduplication, we'd pass duplicate inputs to `_extract_graph_with_inputs_outputs`, which would create duplicate placeholders.
+
+### 6.3 `apply_ac_to_graph()` (lines 107–200) — Main Rewriting Loop
+
+#### Processing order (lines 141–148)
+
+```python
+recomp_acts.sort(key=lambda x: x[1]["first_bwd_use"])
+```
+
+We process activations in order of their first backward use (earliest first). This matters because `inserting_before(node)` inserts relative to a specific node — earlier insertions don't shift later insertion points since FX tracks node ordering by linked-list pointers, not indices.
+
+#### In-place op detection (lines 153–162)
+
+```python
+target_name = str(getattr(act_node, 'target', ''))
+if target_name.endswith('_') and 'relu' in target_name:
+    skip_count += 1
+    continue
+```
+
+PyTorch names in-place ops with a trailing underscore: `relu_`, `add_`, etc. `_extract_graph_with_inputs_outputs` rejects these as outputs because in-place ops don't produce a new tensor — they modify their input. We detect and skip them.
+
+ResNet-152 has 64 `relu_` activations out of 78 recomputed. BERT uses no in-place ops, so all 115 activations are rewritten successfully.
+
+#### Subgraph extraction (lines 181–189)
+
+```python
+recomp_subgraph = _extract_graph_with_inputs_outputs(
+    joint_graph=gm.graph,
+    inputs=current_inputs,
+    outputs=[current_act],
+    outputs_descs=[AOTOutput()],
+)
+```
+
+`_extract_graph_with_inputs_outputs` (from `torch._functorch.partitioners`) finds the minimal subgraph: all nodes on any path from `inputs` to `outputs`. It returns a new `fx.Graph` where inputs become placeholders and outputs become the return.
+
+**`outputs_descs=[AOTOutput()]`**: Required by PyTorch 2.5. `AOTOutput` is a descriptor with no fields — just a type marker. One descriptor per output.
+
+The `try/except` around this call handles edge cases (e.g., outputs that reference nodes outside the subgraph).
+
+#### Node insertion (lines 195–216)
+
+```python
+with gm.graph.inserting_before(current_first_bwd):
+    for n in recomp_subgraph.nodes:
+        if n.op == "placeholder" or n.op == "output":
+            continue
+        new_node = gm.graph.node_copy(
+            n, arg_transform=lambda arg: name_to_node[arg.name]
+        )
+```
+
+`gm.graph.inserting_before(node)` is a context manager that makes all new nodes appear just before `node` in the graph. Inside:
+
+1. **Skip placeholders/outputs**: Subgraph placeholders correspond to our `available_inputs` (already in the main graph). The output node is just `return (value,)`.
+
+2. **`node_copy(n, arg_transform)`**: Creates a copy of subgraph node `n` in the main graph. The `arg_transform` callback maps each argument (an `fx.Node` reference in the subgraph) to the corresponding node in the main graph. We use `name_to_node[arg.name]` for this mapping.
+
+3. **`name_to_node[n.name] = new_node`**: After copying, we update the mapping. This is essential for two reasons:
+   - Within the same subgraph, later nodes may reference earlier copied nodes
+   - Future activation recomputations may need nodes inserted by this iteration
+
+#### Use replacement (lines 208–212)
+
+```python
+if n.name == act_name:
+    old_node = name_to_node[act_name]
+    replace_subsequent_uses_of(gm.graph, old_node=old_node, new_node=new_node)
+```
+
+When we've copied the final node of the subgraph (the activation we're recomputing), we call `replace_subsequent_uses_of` to redirect all backward uses from the original activation to this new recomputed version.
+
+#### Finalization (lines 218–220)
+
+```python
+gm.graph.lint()
+gm.recompile()
+```
+
+`lint()` validates graph integrity — checks that all node references are valid, no dangling edges, topological order is consistent. `recompile()` regenerates the Python `forward()` function from the modified graph, making the `GraphModule` executable.
+
+### 6.4 `verify_correctness()` (lines 230–267)
+
+Runs both graphs with the same inputs, flattens all output tensors (the training graph returns nested tuples of parameters, optimizer states, etc.), and compares element-by-element with `torch.allclose(atol=1e-5, rtol=1e-4)`.
+
+**Why `_flatten_tensors`?** The graph output is `(None, [param_tensors...], [opt_state_tensors...])` — a nested structure. Simple `zip` on the top level would compare `None` with `None` and `list` with `list`, missing the actual tensor comparisons. Recursive flattening extracts all tensors regardless of nesting depth.
+
+### 6.5 Phase 3 in `run_experiments.py`
+
+`profile()` now returns `(profiler, gm, flat_args)` — the GraphModule and its flattened inputs are needed for Phase 3 rewriting. `run_phase3()`:
+
+1. **Deep-copies the GraphModule** (`copy.deepcopy(gm)`) to avoid corrupting the profiler's graph.
+2. Calls `apply_ac_to_graph()` on the copy.
+3. Runs `verify_correctness()` against the original.
+4. Measures latency: 2 warmup + 5 measured iterations with CUDA events, both original and modified.
+
+### 6.6 Updated End-to-End Flow
+
+```
+run_experiments.py main()
+├── run_phase1()
+│   └── profile() → (profiler, gm, flat_args)   [NEW: returns gm + args]
+├── run_phase2(results_no_ac, profilers)
+│   └── mu_two_algorithm() → ACDecision
+├── run_phase3(profilers, graph_data, decisions)  [NEW]
+│   ├── copy.deepcopy(gm)
+│   ├── apply_ac_to_graph(modified_gm, profiler, decision)
+│   │   ├── find_recomp_inputs() per activation
+│   │   ├── _extract_graph_with_inputs_outputs()
+│   │   ├── gm.graph.node_copy() + inserting_before()
+│   │   └── replace_subsequent_uses_of()
+│   ├── verify_correctness(gm, modified_gm, args)
+│   └── latency measurement (CUDA events)
+└── print_summary()
+```

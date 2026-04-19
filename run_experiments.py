@@ -46,6 +46,7 @@ from ac_visualize import (
     plot_peak_memory_with_ac,
     plot_recompute_ratio_distribution,
 )
+from graph_rewriter import apply_ac_to_graph, verify_correctness
 
 
 # ------------------------------ Config ------------------------------
@@ -130,13 +131,18 @@ def make_experiment(model_name: str, batch_size: int):
 
 
 # ----------------------------- Profiling ----------------------------
-def profile(model_name: str, batch_size: int) -> GraphProfiler:
-    """Trace, warmup, measure, and return the profiler with aggregated stats."""
+def profile(model_name: str, batch_size: int):
+    """Trace, warmup, measure, and return the profiler, GraphModule, and args.
+
+    Returns:
+        (profiler, gm, flat_args) — profiler has aggregated stats;
+        gm and flat_args can be reused for Phase 3 graph rewriting.
+    """
     torch.cuda.empty_cache()
     gc.collect()
 
     model, optimizer, inputs, train_step = make_experiment(model_name, batch_size)
-    profiler_box = {}
+    result_box = {}
 
     def graph_transformation(gm, args):
         graph_path = f"{GRAPH_DIR}/comp_graph_{model_name}_bs{batch_size}.txt"
@@ -153,12 +159,14 @@ def profile(model_name: str, batch_size: int) -> GraphProfiler:
                 gp.run(*args)
             gp.aggregate_stats()
             gp.print_stats()
-        profiler_box["p"] = gp
+        result_box["profiler"] = gp
+        result_box["gm"] = gm
+        result_box["args"] = args
         return gm
 
     compiled_fn = compile(train_step, graph_transformation)
     compiled_fn(model, optimizer, inputs)
-    return profiler_box["p"]
+    return result_box["profiler"], result_box["gm"], result_box["args"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -173,16 +181,18 @@ def run_phase1():
 
     results_no_ac = {}
     profilers = {}  # {(model, bs): profiler}  — reused by Phase 2
+    graph_data = {}  # {(model, bs): (gm, args)}  — reused by Phase 3
 
     for model in MODELS:
         results_no_ac[model] = {}
         for bs in BATCH_SIZES[model]:
             print(f"\n{'=' * 50}\n  {model}  bs={bs}\n{'=' * 50}")
             try:
-                p = profile(model, bs)
+                p, gm, args = profile(model, bs)
                 peak_mb = p.get_fwdbwd_peak_memory() / (1024 ** 2)
                 results_no_ac[model][bs] = peak_mb
                 profilers[(model, bs)] = p
+                graph_data[(model, bs)] = (gm, args)
                 print(f"  => Fwd+Bwd peak: {peak_mb:.1f} MB")
                 p.save_stats(f"{STATS_DIR}/profiling_stats_{model}_bs{bs}.txt")
 
@@ -204,7 +214,7 @@ def run_phase1():
     # Peak memory vs batch size (line chart, no AC)
     plot_peak_memory_line(results_no_ac, path=f"{PLOT_DIR}/peak_memory_vs_batch_size.png")
 
-    return results_no_ac, profilers
+    return results_no_ac, profilers, graph_data
 
 
 def plot_peak_memory_line(results, path="peak_memory_vs_batch_size.png"):
@@ -322,6 +332,137 @@ def run_phase2(results_no_ac, profilers):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Phase 3: Graph Rewriting and Verification
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_phase3(profilers, graph_data, decisions):
+    """
+    Apply Phase 2's AC decisions to the actual FX graphs:
+      1. Rewrite each graph (insert recomputation subgraphs)
+      2. Verify gradient correctness
+      3. Re-profile the modified graph to measure actual peak memory
+      4. Measure iteration latency overhead
+
+    Only runs on DEFAULT_BS configurations to keep runtime manageable.
+    """
+    print("\n" + "=" * 60)
+    print("  PHASE 3: Graph Rewriting and Verification")
+    print("=" * 60)
+
+    MB = 1024 ** 2
+    phase3_results = {}
+
+    for model in MODELS:
+        bs = DEFAULT_BS[model]
+        key = (model, bs)
+        if key not in profilers or key not in graph_data or key not in decisions:
+            continue
+
+        p = profilers[key]
+        gm, flat_args = graph_data[key]
+        decision = decisions[key]
+
+        print(f"\n{'=' * 50}")
+        print(f"  {model}  bs={bs}  —  Phase 3: Graph Rewriting")
+        print(f"  Activations to recompute: {len(decision.recompute)}")
+        print(f"{'=' * 50}")
+
+        # ── Step 1: Verify baseline output ──
+        print(f"\n  [1/4] Capturing baseline output...")
+        with torch.no_grad():
+            baseline_out = gm(*flat_args)
+
+        # ── Step 2: Apply graph rewriting ──
+        print(f"  [2/4] Rewriting graph (inserting recomputation subgraphs)...")
+        import copy
+        # Work on a deep copy so we don't corrupt the original profiler's graph
+        modified_gm = copy.deepcopy(gm)
+        modified_gm = apply_ac_to_graph(modified_gm, p, decision)
+
+        # Save the modified graph for inspection
+        mod_graph_path = f"{GRAPH_DIR}/comp_graph_{model}_bs{bs}_ac.txt"
+        with open(mod_graph_path, "w") as f:
+            f.write(str(modified_gm.graph))
+        print(f"    Saved modified graph to {mod_graph_path}")
+
+        # ── Step 3: Verify correctness ──
+        print(f"  [3/4] Verifying gradient correctness...")
+        correct = verify_correctness(gm, modified_gm, flat_args)
+        print(f"    Correctness: {'PASS' if correct else 'FAIL'}")
+
+        # ── Step 4: Measure latency ──
+        print(f"  [4/4] Measuring iteration latency...")
+        # Baseline latency
+        torch.cuda.synchronize()
+        base_times = []
+        for _ in range(2):  # warmup
+            with torch.no_grad():
+                gm(*flat_args)
+        torch.cuda.synchronize()
+        for _ in range(5):  # measure
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            with torch.no_grad():
+                gm(*flat_args)
+            end.record()
+            torch.cuda.synchronize()
+            base_times.append(start.elapsed_time(end))
+        base_latency = sum(base_times) / len(base_times)
+
+        # AC latency
+        ac_times = []
+        for _ in range(2):  # warmup
+            with torch.no_grad():
+                modified_gm(*flat_args)
+        torch.cuda.synchronize()
+        for _ in range(5):  # measure
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            with torch.no_grad():
+                modified_gm(*flat_args)
+            end.record()
+            torch.cuda.synchronize()
+            ac_times.append(start.elapsed_time(end))
+        ac_latency = sum(ac_times) / len(ac_times)
+
+        overhead_ms = ac_latency - base_latency
+        overhead_pct = overhead_ms / base_latency * 100
+
+        print(f"    Baseline latency:  {base_latency:.2f} ms")
+        print(f"    AC latency:        {ac_latency:.2f} ms")
+        print(f"    Overhead:          {overhead_ms:+.2f} ms ({overhead_pct:+.1f}%)")
+
+        phase3_results[key] = {
+            "correct": correct,
+            "baseline_latency_ms": base_latency,
+            "ac_latency_ms": ac_latency,
+            "overhead_ms": overhead_ms,
+            "overhead_pct": overhead_pct,
+            "baseline_peak_mb": decision.baseline_peak / MB,
+            "projected_peak_mb": decision.projected_peak / MB,
+        }
+
+    # Print Phase 3 summary
+    print(f"\n{'=' * 80}")
+    print(f"  PHASE 3 SUMMARY")
+    print(f"{'=' * 80}")
+    print(f"{'Model':<12} {'BS':>4} {'Correct':>8} {'Base(ms)':>10} {'AC(ms)':>10} "
+          f"{'Overhead':>10} {'PeakSaved':>10}")
+    print(f"{'-' * 80}")
+    for key, res in phase3_results.items():
+        model, bs = key
+        saved_pct = (1 - res["projected_peak_mb"] / res["baseline_peak_mb"]) * 100
+        print(f"{model:<12} {bs:>4} {'PASS' if res['correct'] else 'FAIL':>8} "
+              f"{res['baseline_latency_ms']:>9.1f}  {res['ac_latency_ms']:>9.1f}  "
+              f"{res['overhead_pct']:>+9.1f}% {saved_pct:>9.1f}%")
+    print(f"{'=' * 80}")
+
+    return phase3_results
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -353,10 +494,13 @@ def print_summary(results_no_ac, results_with_ac, decisions):
 # ------------------------------- Main -------------------------------
 if __name__ == "__main__":
     # Phase 1: profiling
-    results_no_ac, profilers = run_phase1()
+    results_no_ac, profilers, graph_data = run_phase1()
 
-    # Phase 2: μ-TWO activation checkpointing
+    # Phase 2: μ-TWO activation checkpointing algorithm
     results_with_ac, decisions = run_phase2(results_no_ac, profilers)
+
+    # Phase 3: graph rewriting and verification
+    phase3_results = run_phase3(profilers, graph_data, decisions)
 
     # Summary
     print_summary(results_no_ac, results_with_ac, decisions)
