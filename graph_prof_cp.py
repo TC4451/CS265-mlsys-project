@@ -75,8 +75,15 @@ class GraphProfiler(fx.Interpreter):
         # The argument at position 0 is the list of parameter nodes, while the
         # argument at position 1 is the list of gradient nodes.
 
-
+        # When _fused_adam is absent (foreach optimizer), find first _foreach_*
+        # after sep_backward as the optimizer start.
         self.optimizer_start_idx = self.fused_adam_idx
+        if self.optimizer_start_idx is None and self.sep_backward_idx is not None:
+            for i in range(self.sep_backward_idx + 1, len(self.nodes_list)):
+                if self.nodes_list[i].op == OP.CALL_FUNCTION and \
+                   "_foreach_" in str(self.nodes_list[i].target):
+                    self.optimizer_start_idx = i
+                    break
 
         # --- 2. Classify each node into a region ---
         # Region labels are assigned by index boundaries once separators are found.
@@ -92,7 +99,6 @@ class GraphProfiler(fx.Interpreter):
                 self.node_region[node] = "optimizer"
 
         # --- 3. Identify params, grads, optimizer states ---
-        # _fused_adam(params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, steps,...)
         # %_fused_adam : [num_users=3] = call_function[target=torch.ops.aten._fused_adam.default](
         #     args = (
         #         [%p0, %p1, ...],          # parameters
@@ -148,7 +154,7 @@ class GraphProfiler(fx.Interpreter):
             for user in adam.users:
                 if user.op == OP.CALL_FUNCTION and \
                    user.target == operator.getitem and len(user.args) >= 2:
-                    idx = user.args[1]      #read which of three output is being selected
+                    idx = user.args[1]
                     ntype = adam_output_type.get(idx, NodeType.OPT_STATE)
                     self.node_type_map[user] = ntype
                     # Second-level getitems extract individual tensors from the list
@@ -170,7 +176,7 @@ class GraphProfiler(fx.Interpreter):
         # --- 5. Static data analysis on activations ---
         # For these intermediate nodes in the graph, you will record their last
         # use in the forward pass and their first use in the backward pass.
-        self.act_info: Dict[fx.Node, Dict] = {} #idle span = first_bwd_use - last_fwd_use
+        self.act_info: Dict[fx.Node, Dict] = {}
         for act in self.activation_nodes:
             info = {"name": act.name,
                     "created_at": self.node_to_idx[act],
@@ -209,7 +215,7 @@ class GraphProfiler(fx.Interpreter):
         self._fwdbwd_peak_bd_per_iter: List[Dict] = []
         self._timelines: List[List[Dict]] = []
         self._alive: Dict[fx.Node, int] = {}
-        self._timeline: List[Dict] = [] #set of alive tensors
+        self._timeline: List[Dict] = []
         self._name_to_node: Dict[str, fx.Node] = {n.name: n for n in self.nodes_list}
 
         # Aggregated results
@@ -222,7 +228,7 @@ class GraphProfiler(fx.Interpreter):
 
     @staticmethod
     def _tensor_mem(val) -> int:
-        # Recursively compute output memory in bytes for tensor
+        # Recursively compute output memory in bytes for tensor-valued results.
         if isinstance(val, torch.Tensor):
             return val.element_size() * val.nelement()
         if isinstance(val, (tuple, list)):
@@ -258,11 +264,8 @@ class GraphProfiler(fx.Interpreter):
         # Measure runtime using CUDA events
         use_cuda = torch.cuda.is_available()
         if use_cuda:
-            start = torch.cuda.Event(enable_timing=True)     # time.time() would measure only the time to enqueue the op, not to execute it
+            start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
-            # !!! synchronize again here
-            # !!! line graph instead of bar plot
-            # !!! measure absolute memory consumption
             start.record()
 
         result = super().run_node(n)

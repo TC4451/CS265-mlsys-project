@@ -1,37 +1,64 @@
-# CS265-mlsys-project
+# CS265 Systems Project — Activation Checkpointing
 
-This repo is the starter code for [Harvard CS265 ML Systems project](http://daslab.seas.harvard.edu/classes/cs265).
+Implementing activation checkpointing in PyTorch using the [μ-TWO algorithm](https://proceedings.mlsys.org/paper_files/paper/2023/file/a72071d84c001596e97a2c7e1e880559-Paper-mlsys2023.pdf) (Purandare et al., MLSys 2023). Models: ResNet-152 and BERT-base.
 
-## How to start
-1. Clone the repo
+## Project Structure
 
-2. Create your own upstream, and switch your local repo to the new upstream
+```
+.
+├── graph_tracer.py          # FX graph tracing infrastructure (starter code)
+├── graph_prof.py            # Phase 1: computation graph profiler
+├── graph_prof_cp.py         # Profiler copy (backup)
+├── ac_algorithm.py          # Phase 2: μ-TWO activation checkpointing algorithm
+├── ac_visualize.py          # Phase 2: visualization functions
+├── activation_checkpoint.py # Phase 3: subgraph extractor and graph rewriter
+├── run_experiments.py       # Experiment runner (Phases 1 + 2)
+├── utils.py                 # Decomposition tables for tracing
+├── starter_code.py          # Original starter code
+├── benchmarks.py            # Benchmarking utilities
+├── visualize_graph.py       # Graph visualization helper
+├── reports/                 # Written reports
+│   ├── midway_checkin_report.md / .pdf / .tex
+│   └── phase2_report.md
+├── docs/                    # Reference documents
+│   ├── CS_265_Systems_Project_Description.pdf
+│   └── report_template.pdf
+└── outputs/                 # Generated experiment results (gitignored)
+    ├── profiling_stats/     # Per-node profiling data (.txt)
+    ├── comp_graphs/         # Full FX graph dumps (.txt)
+    ├── ac_decisions/        # Algorithm decisions (.txt)
+    └── plots/               # All visualization PNGs
+```
 
-3. Prepare the software environment
-``` bash
+## Setup
+
+```bash
 conda create -n cs265
 conda activate cs265
-
-conda install conda-forge::python=3.12 conda-forge::numpy=2.2.2 pytorch::pytorch=2.5.1 pytorch::pytorch-cuda=12.4 -n cs265
+conda install conda-forge::python=3.12 conda-forge::numpy=2.2.2 \
+    pytorch::pytorch=2.5.1 pytorch::pytorch-cuda=12.4 -n cs265
+pip install transformers torchvision matplotlib
 ```
 
-4. Run the starter code
-``` bash
-python starter_code.py
+## Running Experiments
+
+```bash
+conda activate cs265
+python run_experiments.py
 ```
 
-5. If you have any questions, feel free to come to the labs and/or share at Ed!
+This runs both Phase 1 (profiling) and Phase 2 (μ-TWO algorithm) for ResNet-152 and BERT at batch sizes 2, 4, 8, 16. Results are saved under `outputs/`.
 
-## Useful materials
-1. The section recordings
+## Phases
 
-The section slides and recordings can be found at the class webpage: http://daslab.seas.harvard.edu/classes/cs265
+| Phase | Weight | Status | Description |
+|-------|-------:|--------|-------------|
+| 1. Graph Profiler | 35% | Done | Per-node timing, memory, tensor classification, activation lifetimes |
+| 2. AC Algorithm | 20% | Done | μ-TWO greedy recomputation: `recompute_ratio = mem / time` |
+| 3. Graph Rewriter | 45% | TODO | Subgraph extraction, backward-pass insertion, correctness verification |
 
-2. The Mu2 paper
+## References
 
-Sanket Purandare, Abdul Wasay, Animesh Jain, Stratos Idreos:
-[μ-TWO: 3× Faster Multi-Model Training with Orchestration and Memory Optimization](https://proceedings.mlsys.org/paper_files/paper/2023/file/a72071d84c001596e97a2c7e1e880559-Paper-mlsys2023.pdf). MLSys 2023
-
-3. The official PyTorch documents
-
-[torch.fx](https://pytorch.org/docs/2.5/fx.html) is particularly relevant to our project.
+- [μ-TWO: 3x Faster Multi-Model Training (MLSys 2023)](https://proceedings.mlsys.org/paper_files/paper/2023/file/a72071d84c001596e97a2c7e1e880559-Paper-mlsys2023.pdf)
+- [torch.fx documentation](https://pytorch.org/docs/2.5/fx.html)
+- [CS265 course page](http://daslab.seas.harvard.edu/classes/cs265)
