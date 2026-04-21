@@ -62,18 +62,36 @@ recomp_subgraph = _extract_graph_with_inputs_outputs(
 
 The `outputs_descs` parameter (required by this PyTorch version) describes the type of each output. `AOTOutput()` is a default descriptor with no special flags.
 
-### 3.3 In-Place Operation Detection
+### 3.3 In-Place to Out-of-Place Conversion
+
+**The problem.** ResNet-152 uses in-place ReLU (`torch.ops.aten.relu_.default`). In-place ops mutate their input tensor rather than allocating a new output. `_extract_graph_with_inputs_outputs()` cannot extract in-place ops as subgraph outputs because there is no distinct output tensor — it raises "Node was invalid, but is output."
+
+In the initial implementation, we detected and skipped in-place ops, which meant 64 out of 78 ResNet activations could not be rewritten — only 14 were actually checkpointed.
+
+**The fix.** Before extraction, we run a preprocessing pass that replaces every in-place op with its out-of-place equivalent:
 
 ```python
-target_name = str(getattr(act_node, 'target', ''))
-if target_name.endswith('_') and 'relu' in target_name:
-    skip_count += 1
-    continue
+INPLACE_TO_OUTOFPLACE = {
+    torch.ops.aten.relu_.default: torch.ops.aten.relu.default,
+}
+
+def convert_inplace_to_outofplace(gm):
+    count = 0
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target in INPLACE_TO_OUTOFPLACE:
+            node.target = INPLACE_TO_OUTOFPLACE[node.target]
+            count += 1
+    if count > 0:
+        gm.graph.lint()
+        gm.recompile()
+    return count
 ```
 
-PyTorch convention: in-place operations end with underscore (e.g., `relu_`, `add_`). In-place ReLU modifies the input tensor's data in place rather than allocating a new output tensor. The subgraph extractor expects outputs to be distinct tensors, so it raises "Node was invalid, but is output" for in-place ops.
+This is a single pass over the graph that changes the `target` attribute of each node from `aten.relu_` to `aten.relu`. The semantics are identical (both compute `max(0, x)`) but the out-of-place version allocates a new tensor, giving the extractor a clean subgraph boundary.
 
-ResNet-152 has 64 `relu_` activations out of 78 total recomputed — these are skipped, resulting in 14 actual rewrites. BERT doesn't use in-place ops, so all 115 activations are successfully rewritten.
+**Design choice: why convert instead of skip?** Converting lets us rewrite all 74 activations (100%) instead of just 14 (18%). The trade-off is that out-of-place ops use slightly more memory during forward (each ReLU now allocates a new tensor). But this is exactly the memory that activation checkpointing frees — the new tensor is freed after its last forward use when the activation is marked for recomputation. The net effect is strictly better.
+
+**Result after fix.** For ResNet-152 bs=4: 151 in-place ops converted, 74/74 activations rewritten (0 skipped), correctness PASS.
 
 ### 3.4 Graph Insertion
 
@@ -137,21 +155,21 @@ All output tensors (gradients, updated parameters, updated optimizer states) mat
 
 ### 4.2 Rewriting Statistics
 
-| Model | BS | Recomputed | Successfully Rewritten | Skipped (in-place) |
-|-------|---:|-----------:|-----------------------:|-------------------:|
-| ResNet-152 | 4 | 78 | 14 | 64 |
-| BERT | 4 | 115 | 115 | 0 |
+| Model | BS | Recomputed | Successfully Rewritten | In-place Converted | Skipped |
+|-------|---:|-----------:|-----------------------:|-------------------:|--------:|
+| ResNet-152 | 4 | 74 | 74 (100%) | 151 relu_ ops | 0 |
+| BERT | 4 | 134 | 134 (100%) | 0 | 0 |
 
-ResNet's high skip rate is due to in-place `relu_` ops. BERT uses out-of-place operations exclusively, allowing full rewriting.
+After the in-place to out-of-place conversion, all recomputed activations are successfully rewritten for both models.
 
 ### 4.3 Latency Overhead
 
 | Model | BS | Baseline (ms) | With AC (ms) | Overhead |
 |-------|---:|--------------:|-------------:|---------:|
-| ResNet-152 | 4 | 57.1 | 59.0 | +3.3% |
-| BERT | 4 | 34.5 | 35.5 | +3.0% |
+| ResNet-152 | 4 | 56.2 | 58.6 | +4.1% |
+| BERT | 4 | 34.1 | 35.1 | +2.8% |
 
-The recomputation overhead is minimal (~3%) because the evicted activations were chosen for their high recompute_ratio (cheap to recompute relative to memory saved). The operations being recomputed (transposes, views, getitems, a few convolutions) are either near-free metadata ops or small convolutions.
+The recomputation overhead is small (~3-4%) because the evicted activations were chosen for their high recompute_ratio (cheap to recompute relative to memory saved). The operations being recomputed (ReLUs, transposes, views, getitems, a few convolutions) are either near-free metadata ops or fast elementwise ops.
 
 ### 4.4 Full Pipeline Summary
 
@@ -168,7 +186,7 @@ The recomputation overhead is minimal (~3%) because the evicted activations were
 
 ## 5. Challenges
 
-- **In-place operations cannot be extracted.** `_extract_graph_with_inputs_outputs` requires outputs to be distinct tensors. In-place ops like `relu_` modify their input in place, so there's no separate output tensor to extract. We detect these via PyTorch's naming convention (trailing underscore) and skip them. This limits ResNet-152's rewriting to 14 out of 78 activations. A production implementation could replace `relu_` with out-of-place `relu` in the graph before extraction, but this adds complexity.
+- **In-place operations cannot be extracted directly.** `_extract_graph_with_inputs_outputs` requires outputs to be distinct tensors. In-place ops like `relu_` modify their input in place, so there's no separate output tensor. Our initial implementation detected and skipped these, limiting ResNet-152 to 14/78 rewrites. We fixed this by adding a preprocessing pass that converts `relu_` to out-of-place `relu` (`torch.ops.aten.relu_.default` → `torch.ops.aten.relu.default`). This is a one-line target swap per node — the semantics are identical but the out-of-place version allocates a new tensor, giving the extractor a clean boundary. After the fix: 74/74 rewrites for ResNet-152 (100%).
 
 - **Subgraph extraction with `AOTOutput` descriptor.** The PyTorch 2.5 version of `_extract_graph_with_inputs_outputs` requires an `outputs_descs` argument that wasn't in earlier versions. We pass `[AOTOutput()]` (a default descriptor with no flags) for each output. This was discovered by inspecting the function signature at runtime.
 

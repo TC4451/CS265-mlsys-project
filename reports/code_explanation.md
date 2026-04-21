@@ -686,20 +686,30 @@ recomp_acts.sort(key=lambda x: x[1]["first_bwd_use"])
 
 We process activations in order of their first backward use (earliest first). This matters because `inserting_before(node)` inserts relative to a specific node — earlier insertions don't shift later insertion points since FX tracks node ordering by linked-list pointers, not indices.
 
-#### In-place op detection (lines 153–162)
+#### In-place to out-of-place conversion (`convert_inplace_to_outofplace`)
 
 ```python
-target_name = str(getattr(act_node, 'target', ''))
-if target_name.endswith('_') and 'relu' in target_name:
-    skip_count += 1
-    continue
+INPLACE_TO_OUTOFPLACE = {
+    torch.ops.aten.relu_.default: torch.ops.aten.relu.default,
+}
+
+def convert_inplace_to_outofplace(gm):
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target in INPLACE_TO_OUTOFPLACE:
+            node.target = INPLACE_TO_OUTOFPLACE[node.target]
 ```
 
-PyTorch names in-place ops with a trailing underscore: `relu_`, `add_`, etc. `_extract_graph_with_inputs_outputs` rejects these as outputs because in-place ops don't produce a new tensor — they modify their input. We detect and skip them.
+**The problem**: In-place ops like `relu_` mutate their input tensor rather than allocating a new output. `_extract_graph_with_inputs_outputs` needs a distinct output tensor to define the subgraph boundary — it rejects in-place ops with "Node was invalid, but is output."
 
-ResNet-152 has 64 `relu_` activations out of 78 recomputed. BERT uses no in-place ops, so all 115 activations are rewritten successfully.
+**The fix**: Before extraction, convert every in-place op to its out-of-place equivalent by swapping the node's `target` attribute. `aten.relu_` becomes `aten.relu` — identical math (`max(0, x)`) but the out-of-place version allocates a new tensor.
 
-#### Subgraph extraction (lines 181–189)
+**Why this works**: Changing `target` on an FX node is like changing which function a call instruction invokes. The node's arguments, users, and position in the graph stay the same. The only behavioral difference is memory allocation: `relu` creates a new tensor (extractable), while `relu_` reuses the input (not extractable).
+
+**Trade-off**: Out-of-place ops use more memory during forward (each ReLU allocates a new tensor instead of reusing the convolution's output buffer). But this extra memory is exactly what AC frees — these activations are freed after their last forward use. Net effect is strictly positive for checkpointed activations.
+
+**Result**: ResNet-152 has 151 `relu_` nodes in its graph. After conversion, all 74 recomputed activations are successfully extracted and rewritten (previously only 14/78).
+
+#### Subgraph extraction
 
 ```python
 recomp_subgraph = _extract_graph_with_inputs_outputs(

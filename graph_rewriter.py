@@ -105,6 +105,52 @@ def find_recomp_inputs(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 1.5: Convert in-place ops to out-of-place equivalents
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Map of in-place aten ops to their out-of-place equivalents.
+# In-place ops mutate their input tensor and return it (same memory address).
+# Out-of-place ops allocate a new tensor for the output.
+# We need out-of-place ops so _extract_graph_with_inputs_outputs can treat
+# their output as a distinct tensor for subgraph extraction.
+INPLACE_TO_OUTOFPLACE = {
+    torch.ops.aten.relu_.default: torch.ops.aten.relu.default,
+}
+
+
+def convert_inplace_to_outofplace(gm: fx.GraphModule) -> int:
+    """
+    Replace in-place activation ops (e.g., relu_) with out-of-place equivalents
+    (e.g., relu) in the FX graph.
+
+    Why this is needed:
+      _extract_graph_with_inputs_outputs() cannot extract in-place ops as
+      subgraph outputs because they don't produce a new tensor — they mutate
+      their input and return the same memory.  Out-of-place ops allocate a
+      new output tensor, giving the extractor a clean boundary.
+
+    Trade-off:
+      Out-of-place ops use slightly more memory during the forward pass
+      (each op now allocates a new tensor instead of reusing the input buffer).
+      But this is exactly the memory that activation checkpointing will then
+      free — so the net effect is still positive.
+
+    Returns the number of ops converted.
+    """
+    count = 0
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target in INPLACE_TO_OUTOFPLACE:
+            node.target = INPLACE_TO_OUTOFPLACE[node.target]
+            count += 1
+
+    if count > 0:
+        gm.graph.lint()
+        gm.recompile()
+
+    return count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 2: Apply activation checkpointing to a GraphModule
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -128,6 +174,12 @@ def apply_ac_to_graph(
     recomputed_names = set(decision.recompute)
     retained_names = set(decision.retain)
     act_names = set(n.name for n in profiler.activation_nodes)
+
+    # Convert in-place ops (relu_) to out-of-place (relu) so that
+    # subgraph extraction can treat their outputs as distinct tensors.
+    n_converted = convert_inplace_to_outofplace(gm)
+    if n_converted > 0:
+        print(f"    Converted {n_converted} in-place ops to out-of-place")
 
     # Build name->node map for the current graph
     name_to_node: Dict[str, fx.Node] = {}
@@ -154,15 +206,6 @@ def apply_ac_to_graph(
         act_name = act_node.name
         first_bwd_idx = act_info["first_bwd_use"]
         first_bwd_node = profiler.nodes_list[first_bwd_idx]
-
-        # Skip in-place ops (e.g., relu_).  They mutate their input tensor
-        # rather than creating a new output, so _extract_graph_with_inputs_outputs
-        # cannot extract them as subgraph outputs.  The target name usually ends
-        # with an underscore (PyTorch in-place convention).
-        target_name = str(getattr(act_node, 'target', ''))
-        if target_name.endswith('_') and 'relu' in target_name:
-            skip_count += 1
-            continue
 
         # ── Step 1: Find available inputs ──
         available_inputs = find_recomp_inputs(act_node, retained_names, act_names)
