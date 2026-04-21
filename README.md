@@ -11,15 +11,18 @@ Implementing activation checkpointing in PyTorch using the [μ-TWO algorithm](ht
 ├── graph_prof_cp.py         # Profiler copy (backup)
 ├── ac_algorithm.py          # Phase 2: μ-TWO activation checkpointing algorithm
 ├── ac_visualize.py          # Phase 2: visualization functions
-├── activation_checkpoint.py # Phase 3: subgraph extractor and graph rewriter
-├── run_experiments.py       # Experiment runner (Phases 1 + 2)
+├── graph_rewriter.py        # Phase 3: subgraph extractor and graph rewriter
+├── activation_checkpoint.py # Phase 3: starter/example code (simple 2-layer net)
+├── run_experiments.py       # Experiment runner (Phases 1 + 2 + 3)
 ├── utils.py                 # Decomposition tables for tracing
 ├── starter_code.py          # Original starter code
 ├── benchmarks.py            # Benchmarking utilities
 ├── visualize_graph.py       # Graph visualization helper
 ├── reports/                 # Written reports
 │   ├── midway_checkin_report.md / .pdf / .tex
-│   └── phase2_report.md
+│   ├── phase2_report.md
+│   ├── phase3_report.md
+│   └── code_explanation.md
 ├── docs/                    # Reference documents
 │   ├── CS_265_Systems_Project_Description.pdf
 │   └── report_template.pdf
@@ -47,7 +50,7 @@ conda activate cs265
 python run_experiments.py
 ```
 
-This runs both Phase 1 (profiling) and Phase 2 (μ-TWO algorithm) for ResNet-152 and BERT at batch sizes 2, 4, 8, 16. Results are saved under `outputs/`.
+This runs all three phases (profiling, μ-TWO algorithm, graph rewriting) for ResNet-152 and BERT at batch sizes 2, 4, 8, 16. Results are saved under `outputs/`.
 
 ## Phases
 
@@ -55,7 +58,7 @@ This runs both Phase 1 (profiling) and Phase 2 (μ-TWO algorithm) for ResNet-152
 |-------|-------:|--------|-------------|
 | 1. Graph Profiler | 35% | Done | Per-node timing, memory, tensor classification, activation lifetimes |
 | 2. AC Algorithm | 20% | Done | μ-TWO greedy recomputation: `recompute_ratio = mem / time` |
-| 3. Graph Rewriter | 45% | TODO | Subgraph extraction, backward-pass insertion, correctness verification |
+| 3. Graph Rewriter | 45% | Done | Subgraph extraction, backward-pass insertion, correctness verification, latency measurement |
 
 ## References
 
