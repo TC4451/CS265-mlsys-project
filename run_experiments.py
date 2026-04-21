@@ -335,114 +335,111 @@ def run_phase2(results_no_ac, profilers):
 # Phase 3: Graph Rewriting and Verification
 # ═══════════════════════════════════════════════════════════════════════
 
+def _measure_latency(gm, flat_args, warmup=2, measure=5):
+    """Measure iteration latency in ms (warmup + CUDA-timed measurement)."""
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        with torch.no_grad():
+            gm(*flat_args)
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(measure):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        with torch.no_grad():
+            gm(*flat_args)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return sum(times) / len(times)
+
+
 def run_phase3(profilers, graph_data, decisions):
     """
     Apply Phase 2's AC decisions to the actual FX graphs:
       1. Rewrite each graph (insert recomputation subgraphs)
-      2. Verify gradient correctness
-      3. Re-profile the modified graph to measure actual peak memory
-      4. Measure iteration latency overhead
+      2. Verify gradient correctness (default BS only)
+      3. Measure iteration latency with and without AC (all batch sizes)
+      4. Generate deliverable 4(c): latency vs batch size plot
 
-    Only runs on DEFAULT_BS configurations to keep runtime manageable.
+    Runs across ALL batch sizes for latency measurement.
+    Correctness verification only on DEFAULT_BS to save time.
     """
+    import copy
     print("\n" + "=" * 60)
     print("  PHASE 3: Graph Rewriting and Verification")
     print("=" * 60)
 
     MB = 1024 ** 2
     phase3_results = {}
+    latency_baseline = {}   # {model: {bs: ms}}
+    latency_ac = {}         # {model: {bs: ms}}
 
     for model in MODELS:
-        bs = DEFAULT_BS[model]
-        key = (model, bs)
-        if key not in profilers or key not in graph_data or key not in decisions:
-            continue
+        latency_baseline[model] = {}
+        latency_ac[model] = {}
 
-        p = profilers[key]
-        gm, flat_args = graph_data[key]
-        decision = decisions[key]
+        for bs in BATCH_SIZES[model]:
+            key = (model, bs)
+            if key not in profilers or key not in graph_data or key not in decisions:
+                continue
 
-        print(f"\n{'=' * 50}")
-        print(f"  {model}  bs={bs}  —  Phase 3: Graph Rewriting")
-        print(f"  Activations to recompute: {len(decision.recompute)}")
-        print(f"{'=' * 50}")
+            p = profilers[key]
+            gm, flat_args = graph_data[key]
+            decision = decisions[key]
+            is_default = (bs == DEFAULT_BS[model])
 
-        # ── Step 1: Verify baseline output ──
-        print(f"\n  [1/4] Capturing baseline output...")
-        with torch.no_grad():
-            baseline_out = gm(*flat_args)
+            print(f"\n{'=' * 50}")
+            print(f"  {model}  bs={bs}  —  Phase 3")
+            print(f"  Activations to recompute: {len(decision.recompute)}")
+            print(f"{'=' * 50}")
 
-        # ── Step 2: Apply graph rewriting ──
-        print(f"  [2/4] Rewriting graph (inserting recomputation subgraphs)...")
-        import copy
-        # Work on a deep copy so we don't corrupt the original profiler's graph
-        modified_gm = copy.deepcopy(gm)
-        modified_gm = apply_ac_to_graph(modified_gm, p, decision)
+            # ── Apply graph rewriting ──
+            print(f"  Rewriting graph...")
+            modified_gm = copy.deepcopy(gm)
+            modified_gm = apply_ac_to_graph(modified_gm, p, decision)
 
-        # Save the modified graph for inspection
-        mod_graph_path = f"{GRAPH_DIR}/comp_graph_{model}_bs{bs}_ac.txt"
-        with open(mod_graph_path, "w") as f:
-            f.write(str(modified_gm.graph))
-        print(f"    Saved modified graph to {mod_graph_path}")
+            if is_default:
+                # Save modified graph for inspection
+                mod_graph_path = f"{GRAPH_DIR}/comp_graph_{model}_bs{bs}_ac.txt"
+                with open(mod_graph_path, "w") as f:
+                    f.write(str(modified_gm.graph))
+                print(f"    Saved modified graph to {mod_graph_path}")
 
-        # ── Step 3: Verify correctness ──
-        print(f"  [3/4] Verifying gradient correctness...")
-        correct = verify_correctness(gm, modified_gm, flat_args)
-        print(f"    Correctness: {'PASS' if correct else 'FAIL'}")
+                # Verify correctness (default BS only — expensive)
+                print(f"  Verifying gradient correctness...")
+                correct = verify_correctness(gm, modified_gm, flat_args)
+                print(f"    Correctness: {'PASS' if correct else 'FAIL'}")
+            else:
+                correct = None  # skip verification for non-default BS
 
-        # ── Step 4: Measure latency ──
-        print(f"  [4/4] Measuring iteration latency...")
-        # Baseline latency
-        torch.cuda.synchronize()
-        base_times = []
-        for _ in range(2):  # warmup
-            with torch.no_grad():
-                gm(*flat_args)
-        torch.cuda.synchronize()
-        for _ in range(5):  # measure
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            with torch.no_grad():
-                gm(*flat_args)
-            end.record()
-            torch.cuda.synchronize()
-            base_times.append(start.elapsed_time(end))
-        base_latency = sum(base_times) / len(base_times)
+            # ── Measure latency ──
+            print(f"  Measuring latency...")
+            base_latency = _measure_latency(gm, flat_args)
+            ac_latency = _measure_latency(modified_gm, flat_args)
+            overhead_ms = ac_latency - base_latency
+            overhead_pct = overhead_ms / base_latency * 100
 
-        # AC latency
-        ac_times = []
-        for _ in range(2):  # warmup
-            with torch.no_grad():
-                modified_gm(*flat_args)
-        torch.cuda.synchronize()
-        for _ in range(5):  # measure
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            with torch.no_grad():
-                modified_gm(*flat_args)
-            end.record()
-            torch.cuda.synchronize()
-            ac_times.append(start.elapsed_time(end))
-        ac_latency = sum(ac_times) / len(ac_times)
+            print(f"    Baseline: {base_latency:.2f} ms  |  AC: {ac_latency:.2f} ms  "
+                  f"|  Overhead: {overhead_ms:+.2f} ms ({overhead_pct:+.1f}%)")
 
-        overhead_ms = ac_latency - base_latency
-        overhead_pct = overhead_ms / base_latency * 100
+            latency_baseline[model][bs] = base_latency
+            latency_ac[model][bs] = ac_latency
 
-        print(f"    Baseline latency:  {base_latency:.2f} ms")
-        print(f"    AC latency:        {ac_latency:.2f} ms")
-        print(f"    Overhead:          {overhead_ms:+.2f} ms ({overhead_pct:+.1f}%)")
+            phase3_results[key] = {
+                "correct": correct,
+                "baseline_latency_ms": base_latency,
+                "ac_latency_ms": ac_latency,
+                "overhead_ms": overhead_ms,
+                "overhead_pct": overhead_pct,
+                "baseline_peak_mb": decision.baseline_peak / MB,
+                "projected_peak_mb": decision.projected_peak / MB,
+            }
 
-        phase3_results[key] = {
-            "correct": correct,
-            "baseline_latency_ms": base_latency,
-            "ac_latency_ms": ac_latency,
-            "overhead_ms": overhead_ms,
-            "overhead_pct": overhead_pct,
-            "baseline_peak_mb": decision.baseline_peak / MB,
-            "projected_peak_mb": decision.projected_peak / MB,
-        }
+    # ── Deliverable 4(c): Iteration latency vs batch size (w and w/o AC) ──
+    plot_latency_vs_batch_size(latency_baseline, latency_ac,
+                               path=f"{PLOT_DIR}/latency_vs_batch_size.png")
 
     # Print Phase 3 summary
     print(f"\n{'=' * 80}")
@@ -451,15 +448,55 @@ def run_phase3(profilers, graph_data, decisions):
     print(f"{'Model':<12} {'BS':>4} {'Correct':>8} {'Base(ms)':>10} {'AC(ms)':>10} "
           f"{'Overhead':>10} {'PeakSaved':>10}")
     print(f"{'-' * 80}")
-    for key, res in phase3_results.items():
+    for key, res in sorted(phase3_results.items()):
         model, bs = key
         saved_pct = (1 - res["projected_peak_mb"] / res["baseline_peak_mb"]) * 100
-        print(f"{model:<12} {bs:>4} {'PASS' if res['correct'] else 'FAIL':>8} "
+        corr_str = 'PASS' if res['correct'] else ('FAIL' if res['correct'] is not None else '—')
+        print(f"{model:<12} {bs:>4} {corr_str:>8} "
               f"{res['baseline_latency_ms']:>9.1f}  {res['ac_latency_ms']:>9.1f}  "
               f"{res['overhead_pct']:>+9.1f}% {saved_pct:>9.1f}%")
     print(f"{'=' * 80}")
 
     return phase3_results
+
+
+def plot_latency_vs_batch_size(latency_baseline, latency_ac,
+                               path="latency_vs_batch_size.png"):
+    """Deliverable 4(c): Iteration latency vs mini-batch size (w and w/o AC)."""
+    models = list(latency_baseline.keys())
+    fig, axes = plt.subplots(1, len(models), figsize=(6 * len(models), 5))
+    if len(models) == 1:
+        axes = [axes]
+
+    for ax, model in zip(axes, models):
+        bs_list = sorted(latency_baseline[model].keys())
+        base = [latency_baseline[model][bs] for bs in bs_list]
+        ac = [latency_ac[model].get(bs) for bs in bs_list]
+
+        ax.plot(bs_list, base, marker="o", linewidth=2, color="#1565C0",
+                label="Without AC")
+        valid_ac = [(b, l) for b, l in zip(bs_list, ac) if l is not None]
+        if valid_ac:
+            ax.plot([b for b, _ in valid_ac], [l for _, l in valid_ac],
+                    marker="s", linewidth=2, color="#D32F2F", label="With AC")
+
+        for b, l in zip(bs_list, base):
+            ax.annotate(f"{l:.1f}", (b, l), textcoords="offset points",
+                        xytext=(0, 8), ha="center", fontsize=8, color="#1565C0")
+        for b, l in valid_ac:
+            ax.annotate(f"{l:.1f}", (b, l), textcoords="offset points",
+                        xytext=(0, -14), ha="center", fontsize=8, color="#D32F2F")
+
+        ax.set_xlabel("Batch Size")
+        ax.set_ylabel("Iteration Latency (ms)")
+        ax.set_title(f"{model}: Latency vs Batch Size")
+        ax.legend(fontsize=9)
+        ax.set_xticks(bs_list)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
