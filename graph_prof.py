@@ -76,7 +76,15 @@ class GraphProfiler(fx.Interpreter):
         # argument at position 1 is the list of gradient nodes.
 
 
+        # When _fused_adam is absent (e.g., foreach optimizer), fall back to
+        # detecting the first _foreach_* op after sep_backward as optimizer start.
         self.optimizer_start_idx = self.fused_adam_idx
+        if self.optimizer_start_idx is None and self.sep_backward_idx is not None:
+            for i in range(self.sep_backward_idx + 1, len(self.nodes_list)):
+                node = self.nodes_list[i]
+                if node.op == OP.CALL_FUNCTION and "_foreach_" in str(node.target):
+                    self.optimizer_start_idx = i
+                    break
 
         # --- 2. Classify each node into a region ---
         # Region labels are assigned by index boundaries once separators are found.

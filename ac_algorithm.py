@@ -166,6 +166,14 @@ def simulate_peak_memory(
     """
     Re-run the memory simulation, but free recomputed activations immediately
     after their last forward use.  Returns (fwd+bwd peak_bytes, timeline).
+
+    Limitation: This simulation models the SAVINGS from freeing activations
+    earlier, but does NOT model the temporary allocations created when those
+    activations are recomputed in the backward pass.  The actual peak after
+    rewriting may be slightly higher than the simulated value because
+    recomputation temporaries can overlap with backward tensors.  For
+    accurate post-rewrite peak measurement, profile the actual rewritten
+    graph (which Phase 3's run_phase3 does via latency measurement).
     """
     nodes = profiler.nodes_list
     act_info = profiler.act_info
