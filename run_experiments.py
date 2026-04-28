@@ -87,7 +87,7 @@ def make_experiment(model_name: str, batch_size: int):
         def train_step(model, opt, inputs):
             logits = model(inputs[0])
             loss = F.cross_entropy(logits, inputs[1])
-            loss = SEPFunction.apply(loss)
+            loss = SEPFunction.apply(loss)  #this is how we know where forward ends and backward starts for profiling
             loss.backward()
             opt.step()
             opt.zero_grad()
@@ -109,7 +109,7 @@ def make_experiment(model_name: str, batch_size: int):
             out = model(input_ids=inputs[0], attention_mask=inputs[1])
             logits = out.last_hidden_state[:, 0, :]  # [CLS] token
             loss = F.mse_loss(logits, inputs[2])
-            loss = SEPFunction.apply(loss)
+            loss = SEPFunction.apply(loss)  #insert sentinel ops in graph for profiling to identify forward vs backward phases
             loss.backward()
             opt.step()
             opt.zero_grad()
@@ -118,6 +118,7 @@ def make_experiment(model_name: str, batch_size: int):
         raise ValueError(f"Unknown model: {model_name}")
 
     # Fused Adam: optimizer updates appear as graph ops for profiling.
+    # Fused=true so optimizer appears as a single _fused_adam node
     optimizer = optim.Adam(model.parameters(), lr=1e-4, fused=True, capturable=True)
 
     # Initialize optimizer state so profiling includes optimizer tensors.
@@ -152,6 +153,7 @@ def profile(model_name: str, batch_size: int):
         gp = GraphProfiler(gm)
         with torch.no_grad():
             # 2 warmup + 3 measurement iterations
+            #  first 1–2 runs include one-time GPU overhead (CUDA setup, kernel/autotune, allocator growth), so they’re slower/noisier
             for _ in range(2):
                 gp.run(*args)
             gp.reset_stats()
@@ -162,10 +164,13 @@ def profile(model_name: str, batch_size: int):
         result_box["profiler"] = gp
         result_box["gm"] = gm
         result_box["args"] = args
+
         return gm
 
-    compiled_fn = compile(train_step, graph_transformation)
+    compiled_fn = compile(train_step, graph_transformation) # This compiles the train_step function
     compiled_fn(model, optimizer, inputs)
+    # gp = profiler object with aggregated stats, gm = traced GraphModule, args = flattened input tuple
+    # phase 2 use gp for AC algorithm, phase 3 uses gm and args for graph rewriting and latency measurement
     return result_box["profiler"], result_box["gm"], result_box["args"]
 
 
@@ -180,7 +185,9 @@ def run_phase1():
     print("=" * 60)
 
     results_no_ac = {}
+    # full GraphProfiler objects per experimen
     profilers = {}  # {(model, bs): profiler}  — reused by Phase 2
+    # traced executable graph and its flattened inputs
     graph_data = {}  # {(model, bs): (gm, args)}  — reused by Phase 3
 
     for model in MODELS:
@@ -268,6 +275,7 @@ def run_phase2(results_no_ac, profilers):
                 continue
 
             p = profilers[key]
+            # computed in graph_prof, averaged across forward and backward phases
             baseline_peak = p.avg_fwdbwd_peak
             budget = baseline_peak * AC_BUDGET_FRACTION
 
@@ -278,6 +286,14 @@ def run_phase2(results_no_ac, profilers):
             print(f"{'=' * 50}")
 
             # Run μ-TWO algorithm
+            # ACDecision(
+            #     retain=retain_list,
+            #     recompute=recompute_list,
+            #     baseline_peak=baseline_peak,
+            #     projected_peak=projected_peak,
+            #     memory_saved=baseline_peak - projected_peak,
+            #     iteration_log=iteration_log,
+            # )
             decision = mu_two_algorithm(p, memory_budget=budget)
             decisions[key] = decision
             results_with_ac[model][bs] = decision.projected_peak / MB
@@ -336,7 +352,8 @@ def run_phase2(results_no_ac, profilers):
 # ═══════════════════════════════════════════════════════════════════════
 
 def _measure_latency(gm, flat_args, warmup=2, measure=5):
-    """Measure iteration latency in ms (warmup + CUDA-timed measurement)."""
+    """Measure iteration latency in ms (warmup + CUDA-timed measurement).
+    basicaly runtime per iteration"""
     torch.cuda.synchronize()
     for _ in range(warmup):
         with torch.no_grad():
@@ -371,7 +388,7 @@ def run_phase3(profilers, graph_data, decisions):
     print("  PHASE 3: Graph Rewriting and Verification")
     print("=" * 60)
 
-    MB = 1024 ** 2
+    MB = 1024 ** 2      #bytes to megabytes conversion factor
     phase3_results = {}
     latency_baseline = {}   # {model: {bs: ms}}
     latency_ac = {}         # {model: {bs: ms}}

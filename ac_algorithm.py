@@ -26,7 +26,7 @@ from graph_prof import GraphProfiler, NodeType
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data structures
+# Data structur es
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -120,12 +120,14 @@ def _precompute_peak_contributors(profiler: GraphProfiler) -> Tuple[float, Set[s
     This avoids re-simulating the whole graph at every greedy step.
     """
     tl = profiler.memory_timeline
+    # list of per-node snapshots like
+    #   {"node_name": str, "total_memory": float, "breakdown": Dict[NodeType, float], "region": str}
     if not tl:
         return profiler.avg_fwdbwd_peak, set()
 
     name_to_node = {n.name: n for n in profiler.nodes_list}
 
-    # Find the fwd+bwd peak entry
+    # Find the fwd+bwd peak entry (optimizer not included)
     fwdbwd_entries = [
         e for e in tl
         if profiler.node_region.get(name_to_node.get(e["node_name"])) in ("forward", "loss", "backward")
@@ -133,13 +135,16 @@ def _precompute_peak_contributors(profiler: GraphProfiler) -> Tuple[float, Set[s
     if not fwdbwd_entries:
         return profiler.avg_fwdbwd_peak, set()
 
+    # total memory is the sum of all alive tensors at that point; the peak entry is the one with max total_memory
     peak_entry = max(fwdbwd_entries, key=lambda e: e["total_memory"])
+    # first index of the peak entry in the original timeline (there could be multiple entries with the same total_memory, but we take the first one)
     peak_idx = next(i for i, e in enumerate(tl) if e is peak_entry)
 
     # Walk the simulation to find which activations are alive at peak_idx
     act_names = set(n.name for n in profiler.activation_nodes)
     alive: Dict[fx.Node, int] = {}
 
+    # if last user of an activation is the current node, that means the activation is freed after this node, so we pop it from alive
     for i, node in enumerate(profiler.nodes_list):
         mem = profiler._node_output_mem.get(node.name, 0)
         if mem > 0 and node.op != "output":
@@ -180,8 +185,9 @@ def simulate_peak_memory(
     node_region = profiler.node_region
     node_type_map = profiler.node_type_map
 
-    # Build adjusted last_user: recomputed activations freed after last fwd use
-    adjusted_last_user: Dict[fx.Node, fx.Node] = dict(profiler.last_user)
+    #   For recomputed activations, override last_user to be the last forward use → freed after forward instead of persisting
+    #   through backward
+    adjusted_last_user: Dict[fx.Node, fx.Node] = dict(profiler.last_user)   # dict(...) copy: critical because the profiler is shared across multiple algorithm runs
     for act_node in profiler.activation_nodes:
         if act_node.name in recomputed_names:
             info = act_info[act_node]
@@ -272,11 +278,11 @@ def mu_two_algorithm(
     step = 0
 
     while candidates and estimated_peak > memory_budget:
-        # ── Pick candidate with highest recompute_ratio ──
+        # ── Pick candidate with highest recompute_ratio ──     #mem / recomp_time
         best_name = max(candidates, key=lambda n: infos[n].recompute_ratio)
         best = infos[best_name]
 
-        # Skip zero-size activations (nothing to save)
+        # Skip zero-size activations (nothing to save)  e.g. node output is not a real tensor payload (metadata/shape-like values
         if best.memory_size == 0:
             candidates.discard(best_name)
             continue
@@ -290,8 +296,19 @@ def mu_two_algorithm(
             estimated_peak -= best.memory_size
 
         # ── Propagate side-effects to remaining candidates ──
+        # Example:
+        #   A depends on B, and B depends on C.
+        #   Before evicting B:
+        #       A.recomp_srcs = {B}, A.recomp_time = 3 ms
+        #       B.recomp_srcs = {C}, B.recomp_time = 2 ms
+        #   After evicting B:
+        #       A.recomp_srcs becomes {C}
+        #       A.recomp_time becomes 5 ms (3 + 2)
+        #       A.recompute_ratio decreases (same memory, larger recompute time)
+        # This captures transitive side-effects of an eviction.
         for cand_name in list(candidates):
             cand = infos[cand_name]
+            # best = the one to discard
             if best_name in cand.recomp_srcs:
                 cand.recomp_srcs.discard(best_name)
                 cand.recomp_srcs.update(best.recomp_srcs)

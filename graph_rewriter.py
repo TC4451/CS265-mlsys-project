@@ -40,6 +40,8 @@ def replace_subsequent_uses_of(
     We walk the graph in reverse and stop when we reach new_node. Any node
     that uses old_node and is after new_node gets its input swapped.
     """
+    #  node.users is a live view that mutates when replace_input_with is called. Iterating over a mutating
+    #   dict raises RuntimeError.
     old_node_users = dict(old_node.users)  # snapshot — users dict changes during iteration
     for node in reversed(list(graph.nodes)):
         if node == new_node:
@@ -113,6 +115,8 @@ def find_recomp_inputs(
 # Out-of-place ops allocate a new tensor for the output.
 # We need out-of-place ops so _extract_graph_with_inputs_outputs can treat
 # their output as a distinct tensor for subgraph extraction.
+# For recomputation, you want “recompute this activation value as an output.”
+# In ResNet-152, this would convert 151 aten.relu_ → aten.relu nodes.
 INPLACE_TO_OUTOFPLACE = {
     torch.ops.aten.relu_.default: torch.ops.aten.relu.default,
 }
@@ -144,8 +148,8 @@ def convert_inplace_to_outofplace(gm: fx.GraphModule) -> int:
             count += 1
 
     if count > 0:
-        gm.graph.lint()
-        gm.recompile()
+        gm.graph.lint() #checks FX graph consistency after edit
+        gm.recompile()  # regenerates the executable Python code for the GraphModule from the modified graph
 
     return count
 
@@ -233,7 +237,7 @@ def apply_ac_to_graph(
                 skip_count += 1
                 continue
 
-            try:
+            try:    #find all nodes between inputs and outputs (inclusive) and copy them into a new graph
                 recomp_subgraph = _extract_graph_with_inputs_outputs(
                     joint_graph=gm.graph,
                     inputs=current_inputs,
@@ -242,7 +246,7 @@ def apply_ac_to_graph(
                 )
             except Exception as e:
                 # Some subgraphs can't be extracted (e.g., in-place ops).
-                # Skip these activations gracefully.
+                # Skip these activations gracefully. None here. 
                 print(f"    [SKIP] {act_name}: subgraph extraction failed ({e})")
                 skip_count += 1
                 continue

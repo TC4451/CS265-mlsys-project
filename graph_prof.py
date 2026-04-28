@@ -268,9 +268,7 @@ class GraphProfiler(fx.Interpreter):
         if use_cuda:
             start = torch.cuda.Event(enable_timing=True)     # time.time() would measure only the time to enqueue the op, not to execute it
             end = torch.cuda.Event(enable_timing=True)
-            # !!! synchronize again here
-            # !!! line graph instead of bar plot
-            # !!! measure absolute memory consumption
+            torch.cuda.synchronize()
             start.record()
 
         result = super().run_node(n)
